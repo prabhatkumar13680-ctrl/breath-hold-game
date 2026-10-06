@@ -32,6 +32,7 @@
   .warn { background: var(--warn-bg); color: var(--warn-fg); padding: .8rem; border-radius: 10px; text-align: left; font-size: .9rem; line-height: 1.4; }
   .warn label { display: block; margin-top: .6rem; font-weight: 600; }
   #status { min-height: 2.6em; margin: 1rem 0 .4rem; }
+  #avatar { width: 100%; max-width: 320px; height: auto; aspect-ratio: 320 / 140; display: block; margin: 0 auto; }
   #timer { font-size: 3.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
   #meter { height: 16px; background: var(--track); border-radius: 8px; overflow: hidden; margin: 1rem 0 1.4rem; }
   #bar { height: 100%; width: 0; background: var(--accent); }
@@ -49,6 +50,7 @@
     <label><input type="checkbox" id="agree" /> I understand</label>
   </div>
   <p id="status">Tick the box, then press Start. Keep the phone about 20-30 cm from your face.</p>
+  <canvas id="avatar"></canvas>
   <div id="timer">0.0s</div>
   <div id="meter"><div id="bar"></div></div>
   <button id="start" disabled>Start</button>
@@ -57,6 +59,7 @@
 
 <script>
 (function () {
+  // ===== Settings you can tweak =====
   var CALIBRATION_MS = 3000, MAX_HOLD_MS = 60000, NOISY_LIMIT = 0.05;
   var MULTIPLIER = 3, MIN_DURATION_MS = 150;
 
@@ -65,6 +68,75 @@
       timerEl = $('timer'), bar = $('bar'), bestEl = $('best');
   var best = 0;
 
+  // ===== Avatar (canvas animation) =====
+  var canvas = $('avatar'), g = canvas.getContext('2d');
+  var W = 320, H = 140, dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  g.scale(dpr, dpr);
+
+  var running = false, speed = 1, legPhase = 0, groundX = 0, lastT = 0;
+
+  function cssVar(name, fallback) {
+    var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  }
+  function line(x1, y1, x2, y2) {
+    g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+  }
+
+  function drawAvatar(t) {
+    var dt = lastT ? Math.min((t - lastT) / 1000, 0.05) : 0;
+    lastT = t;
+    if (running) {
+      legPhase += dt * 10 * speed;
+      groundX = (groundX + dt * 120 * speed) % 40;
+    }
+    var fg = cssVar('--fg', '#111'), track = cssVar('--track', '#ddd');
+    g.clearRect(0, 0, W, H);
+    g.lineCap = 'round';
+
+    // ground and moving dashes
+    var groundY = 110;
+    g.strokeStyle = track; g.lineWidth = 3;
+    line(0, groundY, W, groundY);
+    g.lineWidth = 2;
+    for (var x = -groundX; x < W; x += 40) line(x, groundY + 12, x + 16, groundY + 12);
+
+    // body positions
+    var cx = W / 2;
+    var swing = running ? Math.sin(legPhase) : 0;
+    var cosv = running ? Math.cos(legPhase) : 0;
+    var bob = running ? Math.abs(cosv) * 4 : 0;
+    var hipY = groundY - 38 - bob;
+    var lean = running ? 6 : 0;
+    var shX = cx + lean, shY = hipY - 34;
+
+    g.strokeStyle = fg; g.fillStyle = fg; g.lineWidth = 5;
+    line(cx, hipY, shX, shY);                              // body
+    g.beginPath(); g.arc(shX + lean / 2, shY - 14, 11, 0, Math.PI * 2); g.fill(); // head
+
+    // legs
+    if (running) {
+      line(cx, hipY, cx + swing * 24, groundY - Math.max(0, -cosv) * 10);
+      line(cx, hipY, cx - swing * 24, groundY - Math.max(0, cosv) * 10);
+    } else {
+      line(cx, hipY, cx - 8, groundY);
+      line(cx, hipY, cx + 8, groundY);
+    }
+    // arms
+    var armY = shY + 24;
+    if (running) {
+      line(shX, shY + 4, shX - swing * 20, armY);
+      line(shX, shY + 4, shX + swing * 20, armY);
+    } else {
+      line(shX, shY + 4, shX - 10, armY);
+      line(shX, shY + 4, shX + 10, armY);
+    }
+    requestAnimationFrame(drawAvatar);
+  }
+  requestAnimationFrame(drawAvatar);
+
+  // ===== Game =====
   agree.addEventListener('change', function () { startBtn.disabled = !agree.checked; });
 
   function baselineOf(samples) {
@@ -99,12 +171,14 @@
       return Math.sqrt(sum / buf.length);
     }
     function stopMic() {
+      running = false;
       stream.getTracks().forEach(function (t) { t.stop(); });
       ctx.close();
     }
 
     var phase = 'calibrating', samples = [];
     var calStart = performance.now(), holdStart = 0, threshold = 0, loudSince = null;
+    running = false;
     timerEl.textContent = '0.0s';
     statusEl.textContent = 'Stay quiet for 3 seconds...';
 
@@ -126,11 +200,14 @@
           threshold = base * MULTIPLIER;
           holdStart = now;
           phase = 'holding';
+          running = true;            // avatar starts running
+          speed = 1;
           statusEl.textContent = 'Hold your breath!';
         }
       } else if (phase === 'holding') {
         var elapsed = now - holdStart;
         timerEl.textContent = (elapsed / 1000).toFixed(1) + 's';
+        speed = Math.min(1 + elapsed / 20000, 2.5);   // runs faster the longer you hold
         var breath = false;
         if (level > threshold) {
           if (loudSince === null) loudSince = now;
@@ -139,7 +216,7 @@
           loudSince = null;
         }
         if (breath || elapsed >= MAX_HOLD_MS) {
-          stopMic();
+          stopMic();                 // avatar stops
           var score = Math.min(elapsed, MAX_HOLD_MS) / 1000;
           if (score > best) best = score;
           statusEl.textContent = 'Game over! Your score: ' + score.toFixed(1) + 's';
